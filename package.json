@@ -1,0 +1,27 @@
+{
+  "name": "mcp-clerk-hono",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@clerk/backend": "latest",
+    "@clerk/hono": "latest",
+    "@clerk/mcp-tools": "latest",
+    "@modelcontextprotocol/hono": "2.0.0-beta.5",
+    "@modelcontextprotocol/server": "2.0.0-beta.5",
+    "hono": "latest",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "oxfmt": "^0.60.0",
+    "oxlint": "^1.75.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typescript": "latest",
+    "wrangler": "latest"
+  }
+}

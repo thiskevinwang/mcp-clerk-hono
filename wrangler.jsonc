@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mcp-clerk-hono",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-24",
+  "observability": {
+    "enabled": true,
+  },
+  "vars": {
+    "CLERK_PUBLISHABLE_KEY": "fixme",
+    "CLERK_SECRET_KEY": "fixme",
+  },
+}
