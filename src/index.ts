@@ -11,12 +11,13 @@ import {
 
 import * as z from "zod/v4";
 
-import { fetchClerkAuthorizationServerMetadata } from "@clerk/mcp-tools/server";
 import { ClerkAuthProvider } from "./clerk-auth-provider";
 
 type Bindings = {
   CLERK_PUBLISHABLE_KEY: string;
   CLERK_SECRET_KEY: string;
+  CLERK_API_URL?: string;
+  CLERK_FAPI_URL?: string;
 };
 
 type AppEnv = {
@@ -43,7 +44,7 @@ const SUPPORTED_SCOPES = [
   "tools/call",
   "prompts/list",
   "prompts/get",
-  "notifications/initialized",
+  // "notifications/initialized",
 ] as const;
 type SupportedScope = (typeof SUPPORTED_SCOPES)[number];
 
@@ -52,7 +53,7 @@ const TOOL_SCOPES: Readonly<Record<string, readonly SupportedScope[]>> = {
   get_authenticated_user: ["profile"],
 };
 
-const app = createMcpHonoApp({ host: "0.0.0.0" }) as unknown as Hono<AppEnv>;
+const app = createMcpHonoApp({ host: "localhost" }) as unknown as Hono<AppEnv>;
 
 // body logger
 app.use(async (c, next) => {
@@ -81,8 +82,7 @@ function createServer() {
   server.registerTool(
     "get_authenticated_user",
     {
-      description:
-        "Returns the Clerk auth details for the authenticated request.",
+      description: "Returns the Clerk auth details for the authenticated request.",
       inputSchema: z.object({}),
     },
     async (_, context) => {
@@ -122,7 +122,10 @@ app.all("/mcp", async (c: AppContext) => {
   const parsedBody = c.get("parsedBody");
   const mcpServerUrl = new URL("/mcp", c.req.url);
   const auth = await requireBearerAuth({
-    verifier: new ClerkAuthProvider({ secretKey: c.env.CLERK_SECRET_KEY }),
+    verifier: new ClerkAuthProvider({
+      secretKey: c.env.CLERK_SECRET_KEY,
+      apiUrl: c.env.CLERK_API_URL,
+    }),
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpServerUrl),
     requiredScopes: requiredScopesForRequest(parsedBody),
   })(c.req.raw);
@@ -139,44 +142,44 @@ app.all("/mcp", async (c: AppContext) => {
 
 import {
   isJSONRPCRequest,
-  isSpecType,
   type ClientRequest,
-  type JSONRPCRequest,
   type ListPromptsRequest,
   type CallToolRequest,
-  type GetPromptRequest,
   type ListToolsRequest,
 } from "@modelcontextprotocol/server";
 
-function isListToolsRequest(
-  request: ClientRequest,
-): request is ListToolsRequest {
-  return isJSONRPCRequest(request) && request.method === "tools/list";
+function isListToolsRequest(request: unknown): request is ListToolsRequest {
+  return (
+    isJSONRPCRequest(request as ClientRequest) && (request as ClientRequest).method === "tools/list"
+  );
 }
 
-function isCallToolRequest(request: ClientRequest): request is CallToolRequest {
-  return isJSONRPCRequest(request) && request.method === "tools/call";
+function isCallToolRequest(request: unknown): request is CallToolRequest {
+  return (
+    isJSONRPCRequest(request as ClientRequest) && (request as ClientRequest).method === "tools/call"
+  );
 }
 
-function isListPromptsRequest(
-  request: ClientRequest,
-): request is ListPromptsRequest {
-  return isJSONRPCRequest(request) && request.method === "prompts/list";
+function isListPromptsRequest(request: unknown): request is ListPromptsRequest {
+  return (
+    isJSONRPCRequest(request as ClientRequest) &&
+    (request as ClientRequest).method === "prompts/list"
+  );
 }
 
 function requiredScopesForRequest(body: unknown): string[] {
   const requiredScopes = new Set<string>(BASE_SCOPES);
   const messages = Array.isArray(body) ? body : [body];
 
-  if (isListToolsRequest(body)) {
-    requiredScopes.add("tools/list");
-  } else if (isListPromptsRequest(body)) {
-    requiredScopes.add("prompts/list");
-  } else if (isCallToolRequest(body)) {
-    requiredScopes.add("tools/call");
-  }
-
   for (const message of messages) {
+    if (isListToolsRequest(message)) {
+      requiredScopes.add("tools/list");
+    } else if (isListPromptsRequest(message)) {
+      requiredScopes.add("prompts/list");
+    } else if (isCallToolRequest(message)) {
+      requiredScopes.add("tools/call");
+    }
+
     if (!isRecord(message) || message.method !== "tools/call") {
       continue;
     }
@@ -204,6 +207,7 @@ async function serveOAuthMetadata(c: AppContext) {
   const mcpServerUrl = new URL("/mcp", c.req.url);
   const oauthMetadata = await getClerkOAuthMetadata(
     c.env.CLERK_PUBLISHABLE_KEY,
+    c.env.CLERK_FAPI_URL,
   );
 
   return (
@@ -217,20 +221,56 @@ async function serveOAuthMetadata(c: AppContext) {
   );
 }
 
-function getClerkOAuthMetadata(publishableKey: string) {
-  const cached = clerkOAuthMetadata.get(publishableKey);
+function getClerkOAuthMetadata(publishableKey: string, fapiUrl?: string) {
+  const cacheKey = JSON.stringify([publishableKey, fapiUrl]);
+  const cached = clerkOAuthMetadata.get(cacheKey);
   if (cached) {
     return cached;
   }
 
-  const pending = fetchClerkAuthorizationServerMetadata({
-    publishableKey,
-  }) as Promise<OAuthMetadata>;
+  const pending = fetchClerkAuthorizationServerMetadata(publishableKey, fapiUrl);
 
-  clerkOAuthMetadata.set(publishableKey, pending);
-  pending.catch(() => clerkOAuthMetadata.delete(publishableKey));
+  clerkOAuthMetadata.set(cacheKey, pending);
+  pending.catch(() => clerkOAuthMetadata.delete(cacheKey));
 
   return pending;
+}
+
+async function fetchClerkAuthorizationServerMetadata(
+  publishableKey: string,
+  fapiUrl?: string,
+): Promise<OAuthMetadata> {
+  const publicFapiUrl = fapiUrlFromPublishableKey(publishableKey);
+  const metadataBaseUrl = new URL(fapiUrl || publicFapiUrl);
+  const metadataUrl = new URL("/.well-known/oauth-authorization-server", metadataBaseUrl);
+  const headers = new Headers();
+
+  if (metadataBaseUrl.origin !== publicFapiUrl.origin) {
+    headers.set("X-Original-Host", publicFapiUrl.host);
+  }
+
+  const response = await fetch(metadataUrl, { headers });
+  if (!response.ok) {
+    throw new Error(
+      `Unable to fetch Clerk OAuth metadata: ${response.status} ${response.statusText}`,
+    );
+  }
+
+  return (await response.json()) as OAuthMetadata;
+}
+
+function fapiUrlFromPublishableKey(publishableKey: string) {
+  const encodedFrontendApi = publishableKey
+    .replace(/^pk_(test|live)_/, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  const paddedFrontendApi = encodedFrontendApi.padEnd(
+    Math.ceil(encodedFrontendApi.length / 4) * 4,
+    "=",
+  );
+  const frontendApi = atob(paddedFrontendApi).replace(/\$$/, "");
+
+  return new URL(`https://${frontendApi}`);
 }
 
 export default app;

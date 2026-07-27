@@ -1,4 +1,4 @@
-import { createClerkClient, type ClerkClient } from "@clerk/backend";
+import { TokenType, verifyMachineAuthToken } from "@clerk/backend/internal";
 import {
   OAuthError,
   OAuthErrorCode,
@@ -8,32 +8,40 @@ import {
 
 type ClerkAuthProviderOptions = {
   secretKey: string;
+  apiUrl?: string;
 };
 
 export class ClerkAuthProvider implements OAuthTokenVerifier {
-  private readonly clerk: ClerkClient;
+  private readonly secretKey: string;
+  private readonly apiUrl?: string;
 
-  constructor({ secretKey }: ClerkAuthProviderOptions) {
+  constructor({ secretKey, apiUrl }: ClerkAuthProviderOptions) {
     if (!secretKey) {
       throw new Error("CLERK_SECRET_KEY is required");
     }
 
-    this.clerk = createClerkClient({ secretKey });
+    this.secretKey = secretKey;
+    this.apiUrl = apiUrl;
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     try {
-      const verified = await this.clerk.idPOAuthAccessToken.verify(token);
-      const runtimeVerified = verified as typeof verified & {
-        client_id?: string;
-      };
-      const clientId = runtimeVerified.clientId || runtimeVerified.client_id;
+      const result = await verifyMachineAuthToken(token, {
+        secretKey: this.secretKey,
+        apiUrl: this.apiUrl,
+      });
 
+      if (result.errors || result.tokenType !== TokenType.OAuthToken || !result.data) {
+        throw invalidToken();
+      }
+
+      const verified = result.data;
       if (
+        !("clientId" in verified) ||
         verified.revoked ||
         verified.expired ||
         verified.expiration === null ||
-        !clientId ||
+        !verified.clientId ||
         !verified.subject
       ) {
         throw invalidToken();
@@ -41,9 +49,9 @@ export class ClerkAuthProvider implements OAuthTokenVerifier {
 
       return {
         token,
-        clientId,
+        clientId: verified.clientId,
         scopes: verified.scopes,
-        expiresAt: toEpochSeconds(verified.expiration),
+        expiresAt: Math.floor(verified.expiration / 1000),
         extra: {
           userId: verified.subject,
         },
@@ -53,35 +61,11 @@ export class ClerkAuthProvider implements OAuthTokenVerifier {
         throw error;
       }
 
-      if (isRejectedTokenResponse(error)) {
-        throw invalidToken();
-      }
-
-      throw error;
+      throw invalidToken();
     }
   }
 }
 
 function invalidToken() {
-  return new OAuthError(
-    OAuthErrorCode.InvalidToken,
-    "Invalid or expired Clerk OAuth access token",
-  );
-}
-
-function isRejectedTokenResponse(error: unknown) {
-  if (typeof error !== "object" || error === null || !("status" in error)) {
-    return false;
-  }
-
-  const status = error.status;
-  return status === 400 || status === 404 || status === 422;
-}
-
-function toEpochSeconds(expiration: number) {
-  // Clerk's JWT resource uses milliseconds, while the access-token
-  // verification endpoint can return a Unix timestamp in seconds.
-  return expiration >= 100_000_000_000
-    ? Math.floor(expiration / 1000)
-    : Math.floor(expiration);
+  return new OAuthError(OAuthErrorCode.InvalidToken, "Invalid or expired Clerk OAuth access token");
 }
