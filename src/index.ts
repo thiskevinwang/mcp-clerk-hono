@@ -201,11 +201,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-const clerkOAuthMetadata = new Map<string, Promise<OAuthMetadata>>();
-
 async function serveOAuthMetadata(c: AppContext) {
   const mcpServerUrl = new URL("/mcp", c.req.url);
-  const oauthMetadata = await getClerkOAuthMetadata(
+  const oauthMetadata = await fetchClerkAuthorizationServerMetadata(
     c.env.CLERK_PUBLISHABLE_KEY,
     c.env.CLERK_FAPI_URL,
   );
@@ -219,21 +217,6 @@ async function serveOAuthMetadata(c: AppContext) {
       scopesSupported: [...SUPPORTED_SCOPES],
     }) ?? c.notFound()
   );
-}
-
-function getClerkOAuthMetadata(publishableKey: string, fapiUrl?: string) {
-  const cacheKey = JSON.stringify([publishableKey, fapiUrl]);
-  const cached = clerkOAuthMetadata.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const pending = fetchClerkAuthorizationServerMetadata(publishableKey, fapiUrl);
-
-  clerkOAuthMetadata.set(cacheKey, pending);
-  pending.catch(() => clerkOAuthMetadata.delete(cacheKey));
-
-  return pending;
 }
 
 async function fetchClerkAuthorizationServerMetadata(
