@@ -4,24 +4,22 @@ import {
   createMcpHandler,
   getOAuthProtectedResourceMetadataUrl,
   McpServer,
-  oauthMetadataResponse,
   requireBearerAuth,
-  type OAuthMetadata,
 } from "@modelcontextprotocol/server";
 
 import * as z from "zod/v4";
 
-import { ClerkAuthProvider } from "./clerk-auth-provider";
+import type { AuthBindings, AuthProviderAdapter, AuthProviderName } from "./auth-provider";
+import * as clerkAuthProvider from "./clerk-auth-provider";
+import * as workosAuthProvider from "./workos-auth-provider";
 
-type Bindings = {
-  CLERK_PUBLISHABLE_KEY: string;
-  CLERK_SECRET_KEY: string;
-  CLERK_API_URL?: string;
-  CLERK_FAPI_URL?: string;
-};
+const AUTH_PROVIDERS = {
+  clerk: clerkAuthProvider,
+  workos: workosAuthProvider,
+} satisfies Record<AuthProviderName, AuthProviderAdapter>;
 
 type AppEnv = {
-  Bindings: Bindings;
+  Bindings: AuthBindings;
   Variables: {
     /**
      * createMcpHonoApp installs JSON middleware that parses the request body and
@@ -63,8 +61,8 @@ app.use(async (c, next) => {
 
 app.get("/", (c) => {
   return c.json({
-    name: "mcp-clerk-hono",
-    message: "Clerk-protected Hono MCP server",
+    name: "mcp-hono-auth-providers",
+    message: "OAuth-protected Hono MCP server",
     mcp: "/mcp",
     oauthProtectedResourceMetadata: "/.well-known/oauth-protected-resource/mcp",
   });
@@ -75,14 +73,14 @@ app.all("/.well-known/oauth-authorization-server", serveOAuthMetadata);
 
 function createServer() {
   const server = new McpServer({
-    name: "mcp-clerk-hono",
+    name: "mcp-hono-auth-providers",
     version: "0.1.0",
   });
 
   server.registerTool(
     "get_authenticated_user",
     {
-      description: "Returns the Clerk auth details for the authenticated request.",
+      description: "Returns the auth details for the authenticated request.",
       inputSchema: z.object({}),
     },
     async (_, context) => {
@@ -93,25 +91,6 @@ function createServer() {
       };
     },
   );
-  server.registerPrompt(
-    "review-code",
-    {
-      title: "Code Review",
-      description: "Review code for best practices",
-      argsSchema: z.object({ code: z.string() }),
-    },
-    ({ code }) => ({
-      messages: [
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text: `Please review this code:\n\n${code}`,
-          },
-        },
-      ],
-    }),
-  );
 
   return server;
 }
@@ -121,13 +100,12 @@ const mcpHandler = createMcpHandler(() => createServer());
 app.all("/mcp", async (c: AppContext) => {
   const parsedBody = c.get("parsedBody");
   const mcpServerUrl = new URL("/mcp", c.req.url);
+  const authProviderName = selectedAuthProviderName(c.env);
+  const authProvider = AUTH_PROVIDERS[authProviderName];
   const auth = await requireBearerAuth({
-    verifier: new ClerkAuthProvider({
-      secretKey: c.env.CLERK_SECRET_KEY,
-      apiUrl: c.env.CLERK_API_URL,
-    }),
+    verifier: authProvider.tokenVerifier(c.env, mcpServerUrl),
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpServerUrl),
-    requiredScopes: requiredScopesForRequest(parsedBody),
+    requiredScopes: authProviderName === "clerk" ? requiredScopesForRequest(parsedBody) : [],
   })(c.req.raw);
 
   if (auth instanceof Response) {
@@ -203,57 +181,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function serveOAuthMetadata(c: AppContext) {
   const mcpServerUrl = new URL("/mcp", c.req.url);
-  const oauthMetadata = await fetchClerkAuthorizationServerMetadata(
-    c.env.CLERK_PUBLISHABLE_KEY,
-    c.env.CLERK_FAPI_URL,
-  );
+  const authProvider = AUTH_PROVIDERS[selectedAuthProviderName(c.env)];
 
   return (
-    oauthMetadataResponse(c.req.raw, {
-      oauthMetadata,
+    (await authProvider.serveOAuthMetadata(c.env, {
+      request: c.req.raw,
       resourceServerUrl: mcpServerUrl,
-      resourceName: "mcp-clerk-hono",
+      resourceName: "mcp-hono-auth-providers",
       serviceDocumentationUrl: new URL("/", c.req.url),
       scopesSupported: [...SUPPORTED_SCOPES],
-    }) ?? c.notFound()
+    })) ?? c.notFound()
   );
 }
 
-async function fetchClerkAuthorizationServerMetadata(
-  publishableKey: string,
-  fapiUrl?: string,
-): Promise<OAuthMetadata> {
-  const publicFapiUrl = fapiUrlFromPublishableKey(publishableKey);
-  const metadataBaseUrl = new URL(fapiUrl || publicFapiUrl);
-  const metadataUrl = new URL("/.well-known/oauth-authorization-server", metadataBaseUrl);
-  const headers = new Headers();
-
-  if (metadataBaseUrl.origin !== publicFapiUrl.origin) {
-    headers.set("X-Original-Host", publicFapiUrl.host);
+function selectedAuthProviderName(bindings: AuthBindings): AuthProviderName {
+  if (!bindings.AUTH_PROVIDER || bindings.AUTH_PROVIDER === "clerk") {
+    return "clerk";
   }
 
-  const response = await fetch(metadataUrl, { headers });
-  if (!response.ok) {
-    throw new Error(
-      `Unable to fetch Clerk OAuth metadata: ${response.status} ${response.statusText}`,
-    );
+  if (bindings.AUTH_PROVIDER === "workos") {
+    return "workos";
   }
 
-  return (await response.json()) as OAuthMetadata;
-}
-
-function fapiUrlFromPublishableKey(publishableKey: string) {
-  const encodedFrontendApi = publishableKey
-    .replace(/^pk_(test|live)_/, "")
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-  const paddedFrontendApi = encodedFrontendApi.padEnd(
-    Math.ceil(encodedFrontendApi.length / 4) * 4,
-    "=",
-  );
-  const frontendApi = atob(paddedFrontendApi).replace(/\$$/, "");
-
-  return new URL(`https://${frontendApi}`);
+  throw new Error(`Unsupported AUTH_PROVIDER: ${bindings.AUTH_PROVIDER}`);
 }
 
 export default app;
